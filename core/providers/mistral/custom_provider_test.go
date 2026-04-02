@@ -148,7 +148,9 @@ func TestMistralProvider_CustomAliasEmbeddingReportsAliasMetadata(t *testing.T) 
 		Provider: customMistralProviderName,
 		Model:    "codestral-embed",
 		Input: &schemas.EmbeddingInput{
-			Texts: []string{"hello"},
+			Contents: []schemas.EmbeddingContent{
+				{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr("hello")}},
+			},
 		},
 	}
 

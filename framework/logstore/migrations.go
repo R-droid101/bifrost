@@ -313,6 +313,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationAddStopReasonColumn(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationAddEmbeddingInputColumn(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2732,3 +2735,81 @@ func migrationAddStopReasonColumn(ctx context.Context, db *gorm.DB) error {
 	return nil
 }
 
+// migrationAddEmbeddingInputColumn adds the embedding_input column to the logs table and
+// backfills historical embedding logs by reconstructing EmbeddingContent entries from
+// text blocks stored in the old input_history column.
+func migrationAddEmbeddingInputColumn(ctx context.Context, db *gorm.DB) error {
+	opts := *migrator.DefaultOptions
+	opts.UseTransaction = true
+	m := migrator.New(db, &opts, []*migrator.Migration{{
+		ID: "logs_add_embedding_input_column",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			gormMigrator := tx.Migrator()
+			if !gormMigrator.HasColumn(&Log{}, "embedding_input") {
+				if err := gormMigrator.AddColumn(&Log{}, "embedding_input"); err != nil {
+					return err
+				}
+			}
+			dialect := tx.Dialector.Name()
+			switch dialect {
+			case "postgres":
+				return tx.Exec(`
+					UPDATE logs
+					SET embedding_input = (
+						SELECT jsonb_agg(
+							jsonb_build_array(
+								jsonb_build_object('type', 'text', 'text', block->>'text')
+							)
+						)
+						FROM jsonb_array_elements(input_history::jsonb) AS history_item,
+						     jsonb_array_elements(history_item -> 'content' -> 'content_blocks') AS block
+						WHERE block->>'type' = 'text'
+						  AND (block->>'text') IS NOT NULL
+						  AND (block->>'text') != ''
+					)
+					WHERE object_type = 'embedding'
+					  AND input_history IS NOT NULL
+					  AND input_history NOT IN ('', '[]', 'null')
+					  AND embedding_input IS NULL
+				`).Error
+			case "sqlite":
+				return tx.Exec(`
+					UPDATE logs
+					SET embedding_input = (
+						SELECT json_group_array(
+							json_array(
+								json_object('type', 'text', 'text', json_extract(block.value, '$.text'))
+							)
+						)
+						FROM json_each(input_history) AS history_item,
+						     json_each(json_extract(history_item.value, '$.content.content_blocks')) AS block
+						WHERE json_extract(block.value, '$.type') = 'text'
+						  AND json_extract(block.value, '$.text') IS NOT NULL
+						  AND json_extract(block.value, '$.text') != ''
+					)
+					WHERE object_type = 'embedding'
+					  AND input_history IS NOT NULL
+					  AND input_history NOT IN ('', '[]', 'null')
+					  AND embedding_input IS NULL
+				`).Error
+			default:
+				return nil
+			}
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			gormMigrator := tx.Migrator()
+			if gormMigrator.HasColumn(&Log{}, "embedding_input") {
+				if err := gormMigrator.DropColumn(&Log{}, "embedding_input"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error while adding embedding_input column: %s", err.Error())
+	}
+	return nil
+}

@@ -200,6 +200,24 @@ var embeddingParamsKnownFields = map[string]bool{
 	"fallbacks":       true,
 	"encoding_format": true,
 	"dimensions":      true,
+	"task_type":       true,
+	"title":           true,
+	"auto_truncate":   true,
+	"truncate":        true,
+	"max_tokens":      true,
+}
+
+var batchEmbeddingParamsKnownFields = map[string]bool{
+	"model":           true,
+	"items":           true,
+	"fallbacks":       true,
+	"encoding_format": true,
+	"dimensions":      true,
+	"task_type":       true,
+	"title":           true,
+	"auto_truncate":   true,
+	"truncate":        true,
+	"max_tokens":      true,
 }
 
 var rerankParamsKnownFields = map[string]bool{
@@ -516,6 +534,15 @@ type EmbeddingRequest struct {
 	*schemas.EmbeddingParameters
 }
 
+// BatchEmbeddingHTTPRequest is a bifrost batch embedding request.
+// Top-level EmbeddingParameters serve as the default for all items;
+// each item may carry its own Params override.
+type BatchEmbeddingHTTPRequest struct {
+	Items []schemas.BifrostEmbeddingBatchItem `json:"items"`
+	BifrostParams
+	*schemas.EmbeddingParameters
+}
+
 // RerankRequest is a bifrost rerank request
 type RerankRequest struct {
 	Query     string                   `json:"query"`
@@ -661,6 +688,7 @@ var PathToTypeMapping = map[string]schemas.RequestType{
 	"/v1/chat/completions":       schemas.ChatCompletionRequest,
 	"/v1/responses":              schemas.ResponsesRequest,
 	"/v1/embeddings":             schemas.EmbeddingRequest,
+	"/v1/embeddings/batch":       schemas.BatchEmbeddingRequest,
 	"/v1/rerank":                 schemas.RerankRequest,
 	"/v1/ocr":                    schemas.OCRRequest,
 	"/v1/audio/speech":           schemas.SpeechRequest,
@@ -706,6 +734,7 @@ func (h *CompletionHandler) RegisterRoutes(r *router.Router, middlewares ...sche
 	r.POST("/v1/chat/completions", lib.ChainMiddlewares(h.chatCompletion, baseMiddlewares...))
 	r.POST("/v1/responses", lib.ChainMiddlewares(h.responses, baseMiddlewares...))
 	r.POST("/v1/embeddings", lib.ChainMiddlewares(h.embeddings, baseMiddlewares...))
+	r.POST("/v1/embeddings/batch", lib.ChainMiddlewares(h.batchEmbeddings, baseMiddlewares...))
 	r.POST("/v1/rerank", lib.ChainMiddlewares(h.rerank, baseMiddlewares...))
 	r.POST("/v1/ocr", lib.ChainMiddlewares(h.ocr, baseMiddlewares...))
 	r.POST("/v1/audio/speech", lib.ChainMiddlewares(h.speech, baseMiddlewares...))
@@ -1089,8 +1118,11 @@ func prepareEmbeddingRequest(ctx *fasthttp.RequestCtx, config *lib.Config) (*Emb
 	if err != nil {
 		return nil, nil, err
 	}
-	if req.Input == nil || (req.Input.Text == nil && req.Input.Texts == nil && req.Input.Embedding == nil && req.Input.Embeddings == nil) {
+	if req.Input == nil || len(req.Input.Contents) == 0 {
 		return nil, nil, fmt.Errorf("input is required for embeddings")
+	}
+	if err := req.Input.Validate(); err != nil {
+		return nil, nil, err
 	}
 	if req.EmbeddingParameters == nil {
 		req.EmbeddingParameters = &schemas.EmbeddingParameters{}
@@ -1134,6 +1166,63 @@ func (h *CompletionHandler) embeddings(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	// Send successful response
+	SendJSON(ctx, resp)
+}
+
+// prepareBatchEmbeddingRequest prepares a BifrostBatchEmbeddingRequest from the HTTP request body
+func prepareBatchEmbeddingRequest(ctx *fasthttp.RequestCtx, config *lib.Config) (*BatchEmbeddingHTTPRequest, *schemas.BifrostBatchEmbeddingRequest, error) {
+	req, base, err := prepareRequest[BatchEmbeddingHTTPRequest](ctx, config, batchEmbeddingParamsKnownFields)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(req.Items) == 0 {
+		return nil, nil, fmt.Errorf("items are required for batch embedding")
+	}
+	if req.EmbeddingParameters == nil {
+		req.EmbeddingParameters = &schemas.EmbeddingParameters{}
+	}
+	req.EmbeddingParameters.ExtraParams = base.ExtraParams
+	bifrostReq := &schemas.BifrostBatchEmbeddingRequest{
+		Provider:  base.Provider,
+		Model:     base.ModelName,
+		Params:    req.EmbeddingParameters,
+		Items:     req.Items,
+		Fallbacks: base.Fallbacks,
+	}
+	if err := bifrostReq.Validate(); err != nil {
+		return nil, nil, err
+	}
+	return req, bifrostReq, nil
+}
+
+// batchEmbeddings handles POST /v1/embeddings/batch - Process batch embedding requests
+func (h *CompletionHandler) batchEmbeddings(ctx *fasthttp.RequestCtx) {
+	_, bifrostBatchReq, err := prepareBatchEmbeddingRequest(ctx, h.config)
+	if err != nil {
+		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+		return
+	}
+
+	bifrostCtx, cancel := lib.ConvertToBifrostContext(ctx, h.config)
+	defer cancel()
+	if bifrostCtx == nil {
+		SendError(ctx, fasthttp.StatusBadRequest, "Failed to convert context")
+		return
+	}
+
+	resp, bifrostErr := h.client.BatchEmbeddingRequest(bifrostCtx, bifrostBatchReq)
+	if bifrostErr != nil {
+		forwardProviderHeadersFromContext(ctx, bifrostCtx)
+		SendBifrostError(ctx, bifrostErr)
+		return
+	}
+
+	if resp != nil && resp.ExtraFields.ProviderResponseHeaders != nil {
+		forwardProviderHeaders(ctx, resp.ExtraFields.ProviderResponseHeaders)
+	}
+	if streamLargeResponseIfActive(ctx, bifrostCtx) {
+		return
+	}
 	SendJSON(ctx, resp)
 }
 
